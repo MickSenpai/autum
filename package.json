@@ -1,0 +1,27 @@
+{
+  "name": "autum",
+  "version": "1.0.0",
+  "description": "Monitor de tickets sin asignar para ManageEngine ServiceDesk Plus Cloud, con recordatorios por Telegram hasta confirmar.",
+  "main": "src/monitor.js",
+  "scripts": {
+    "setup": "playwright install chromium",
+    "auth": "node src/auth.js",
+    "start": "node src/monitor.js",
+    "test:telegram": "node src/test-telegram.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "servicedesk-plus",
+    "manageengine",
+    "playwright",
+    "telegram-bot",
+    "automation"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.0.0",
+    "playwright": "^1.49.0"
+  }
+}
