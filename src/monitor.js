@@ -7,14 +7,17 @@ const { enviarTelegram, tg, chatId } = require('./notify');
 const {
   SDP_BASE_URL, APP_URL, BANDEJA_URL, AUTH_FILE, STATE_FILE,
   INTERVALO_MS, REMINDER_MIN, ERROR_COOLDOWN_MS, SESION_COOLDOWN_MS,
-  AUSENCIAS_PARA_CERRAR, HEADLESS,
+  AUSENCIAS_PARA_CERRAR, HEADLESS, VISTA_NOMBRE, VISTA_ID,
 } = require('./config');
 
 const RECORDATORIO_MS = REMINDER_MIN * 60 * 1000;
-const RE_ID = /^\d{5,7}$/;
+const RE_ID = /^\d{1,10}$/;
+const FILAS_POR_PAGINA = 100;
+const MAX_PAGINAS = 10;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-let columnasLogueadas = false;
+let vistaLogueada = false;
+let vistaResuelta = null; // { id, nombre } de la vista vigilada, una vez localizada
 
 // Sesión viva del navegador, compartida con el pick up que se dispara desde Telegram
 let contextoActual = null;
@@ -33,7 +36,11 @@ function loadState() {
 
 function saveState(state) {
   state.seen = state.seen.slice(-500);
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+  // Escritura atómica: un corte a mitad de escritura no deja el estado corrupto
+  // (un state.json ilegible haría re-avisar todos los tickets sin grupo)
+  const tmp = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state));
+  fs.renameSync(tmp, STATE_FILE);
 }
 
 /* ---------- Telegram: avisos, recordatorios y confirmaciones ---------- */
@@ -110,9 +117,27 @@ async function enviarRecordatorios(state) {
 
 /* ---------- Pick up vía la API interna de ServiceDesk ---------- */
 
+// Engancha la sesión del navegador para que el pick up pueda usarla
+function conectarSesion(context, page) {
+  page.on('request', r => {
+    if (r.url().startsWith(`${SDP_BASE_URL}/api/v3/`) && r.headers()['x-zcsrf-token']) {
+      cabecerasApi = r.headers();
+    }
+  });
+  contextoActual = context;
+}
+
+function desconectarSesion() {
+  contextoActual = null;
+  cabecerasApi = null;
+}
+
 async function apiSdp(metodo, ruta) {
-  if (!contextoActual || !cabecerasApi) {
+  if (!contextoActual) {
     throw new Error('no hay sesión activa de ServiceDesk (¿expiró? ejecuta "npm run auth")');
+  }
+  if (!cabecerasApi) {
+    throw new Error('todavía no he terminado de cargar la bandeja; vuelve a intentarlo en un minuto');
   }
   const headers = {};
   for (const k of ['accept', 'x-zcsrf-token', 'x-sdpod-appid', 'x-requested-with']) {
@@ -121,8 +146,15 @@ async function apiSdp(metodo, ruta) {
   const res = await contextoActual.request.fetch(`${SDP_BASE_URL}/api/v3${ruta}`, {
     method: metodo, headers, timeout: 20000,
   });
-  const data = await res.json().catch(() => ({}));
-  const rs = [].concat(data.response_status || [])[0] || {};
+  const data = await res.json().catch(() => null);
+
+  // Con la sesión caducada ServiceDesk redirige al login (HTML) en vez de responder JSON
+  const fueraDeSdp = !res.url().startsWith(`${SDP_BASE_URL}/`);
+  if (res.status() === 401 || fueraDeSdp || (res.ok() && (data === null || typeof data !== 'object'))) {
+    throw new Error('ServiceDesk no respondió como API (¿sesión expirada?); ejecuta "npm run auth"');
+  }
+
+  const rs = [].concat((data && data.response_status) || [])[0] || {};
   if (!res.ok() || rs.status_code !== 2000) {
     const detalle = (rs.messages || []).map(m => m.message).filter(Boolean).join('; ');
     throw new Error(`ServiceDesk respondió ${res.status()} ${detalle || rs.status || ''}`.trim());
@@ -143,11 +175,23 @@ async function tomarTicket(state, id) {
     return `ℹ️ Ticket #${id}: ya estaba asignado a ${antes.technician.name}, no lo toqué.`;
   }
 
-  await apiSdp('PUT', `/requests/${p.rowId}/_pickup`);
+  // Un error del PUT puede ser ambiguo (timeout, respuesta con otro formato): lo que manda
+  // es cómo quedó el ticket, así que siempre lo volvemos a consultar.
+  let errorPut = null;
+  try { await apiSdp('PUT', `/requests/${p.rowId}/_pickup`); }
+  catch (e) { errorPut = e; }
 
-  const despues = (await apiSdp('GET', `/requests/${p.rowId}`)).request || {};
+  let despues;
+  try { despues = (await apiSdp('GET', `/requests/${p.rowId}`)).request || {}; }
+  catch (e) { throw errorPut || e; }
+
   const tecnico = despues.technician && despues.technician.name;
-  if (!tecnico) throw new Error('ServiceDesk aceptó el pick up pero el ticket sigue sin técnico; revísalo a mano');
+  if (!tecnico) {
+    throw errorPut || new Error('ServiceDesk aceptó el pick up pero el ticket sigue sin técnico; revísalo a mano');
+  }
+  if (errorPut) {
+    return `ℹ️ Ticket #${id}: quedó asignado a ${tecnico}, aunque el pick up devolvió un error (${errorPut.message}). Compruébalo.`;
+  }
   return `🙋 Ticket #${id}: tomado, asignado a ${tecnico}.`;
 }
 
@@ -252,59 +296,79 @@ async function alertarFallo(state, motivo) {
 
 /* ---------- Lectura de la bandeja ---------- */
 
+// La vista que se vigila es siempre la misma (por defecto "Unassigned Requests"), sin importar
+// cuál tengas seleccionada en tu navegador: ServiceDesk guarda esa selección en tu cuenta, así
+// que leer "lo que muestre la página" haría que Autum cambiara de lista sin avisar.
+async function resolverVista(page, vistaNombre, vistaId) {
+  if (vistaId) return { id: vistaId, nombre: vistaNombre || `id ${vistaId}` };
+  if (vistaResuelta && vistaResuelta.nombre === vistaNombre) return vistaResuelta;
+
+  // Los accesos rápidos de la bandeja traen el nombre y el ID de cada vista
+  await page.waitForSelector('li.sdp-filter-li', { timeout: 20000 });
+  const vistas = await page.$$eval('li.sdp-filter-li', ls =>
+    ls.map(l => ({ nombre: (l.getAttribute('title') || l.innerText || '').trim(), id: l.getAttribute('data-id') }))
+  );
+  const v = vistas.find(x =>
+    x.nombre.toLowerCase() === vistaNombre.toLowerCase() && /^\d+$/.test(x.id || '')
+  );
+  if (!v) {
+    throw new Error(
+      `No encontré la vista "${vistaNombre}" entre los accesos rápidos de la bandeja ` +
+      `(${vistas.map(x => x.nombre).join(', ') || 'ninguno'}). Añádela allí o define SDP_VIEW_ID en el .env`
+    );
+  }
+  vistaResuelta = { id: v.id, nombre: vistaNombre };
+  return vistaResuelta;
+}
+
 // Devuelve 'EXPIRADA' o { sinGrupo: [ids], asignados: Set(ids), internos: { id: idInterno } }
-async function revisar(page) {
+async function revisar(page, { vistaNombre = VISTA_NOMBRE, vistaId = VISTA_ID } = {}) {
+  // Cargar la bandeja mantiene viva la sesión, detecta si expiró y renueva las cabeceras de la API
   await page.goto(BANDEJA_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
   if (!page.url().startsWith(APP_URL)) return 'EXPIRADA';
 
-  await page.waitForSelector('table tbody tr td', { timeout: 20000 });
-  await page.waitForTimeout(1500);
+  const vista = await resolverVista(page, vistaNombre, vistaId);
+  for (let i = 0; i < 80 && !cabecerasApi; i++) await page.waitForTimeout(250);
 
-  // Solo filas que no contengan otras filas, con sus celdas directas
-  const filas = await page.$$eval('table tbody tr', trs =>
-    trs
-      .filter(tr => !tr.querySelector('tr'))
-      .map(tr => ({
-        rowId: tr.getAttribute('data-row-id'),
-        celdas: [...tr.children].map(td => td.innerText.trim()),
-      }))
-      .filter(f => f.celdas.length > 0)
-  );
-  const rowIds = new Map(filas.map(f => [f.celdas, f.rowId]));
-  const rows = filas.map(f => f.celdas);
-
-  // Columna ID = la que más filas con formato de ID tiene
-  const maxCols = Math.max(0, ...rows.map(r => r.length));
-  let iId = -1;
-  let mejor = 0;
-  for (let c = 0; c < maxCols; c++) {
-    const n = rows.filter(r => RE_ID.test(r[c] || '')).length;
-    if (n > mejor) { mejor = n; iId = c; }
-  }
-  if (iId < 0) {
-    throw new Error(`No encontré la columna ID (${rows.length} filas, ${maxCols} columnas máx.)`);
+  // Los tickets se piden a la API con el ID de la vista: no depende del orden de las columnas,
+  // ni de la paginación de la tabla, ni de que la lista esté vacía.
+  const tickets = [];
+  let hayMas = true;
+  for (let pagina = 0; hayMas && pagina < MAX_PAGINAS; pagina++) {
+    const entrada = {
+      list_info: {
+        row_count: FILAS_POR_PAGINA,
+        start_index: pagina * FILAS_POR_PAGINA + 1,
+        fields_required: ['display_id', 'group', 'technician'],
+        filter_by: { id: vista.id },
+        sort_field: 'created_time',
+        sort_order: 'desc',
+      },
+    };
+    const data = await apiSdp('GET', `/requests?input_data=${encodeURIComponent(JSON.stringify(entrada))}`);
+    if (!Array.isArray(data.requests)) throw new Error('ServiceDesk no devolvió la lista de tickets');
+    tickets.push(...data.requests);
+    hayMas = !!(data.list_info && data.list_info.has_more_rows);
   }
 
-  const iGroup = iId + 1; // Group va justo después de ID
-  if (iGroup >= maxCols) {
-    throw new Error(`No hay columna Group después de ID (ID=${iId}, columnas máx.=${maxCols})`);
-  }
-
-  if (!columnasLogueadas) {
-    console.log(`Filas: ${rows.length} | Columna ID=${iId}, Group=${iGroup}`);
-    columnasLogueadas = true;
+  if (!vistaLogueada || hayMas) {
+    console.log(
+      `Vista "${vista.nombre}" (${vista.id}): ${tickets.length} tickets` +
+      (hayMas ? ` (hay más; solo se revisan los ${tickets.length} más recientes)` : '')
+    );
+    vistaLogueada = true;
   }
 
   const sinGrupo = [];
   const asignados = new Set();
-  const internos = {}; // ID visible -> ID interno (data-row-id), necesario para la API
-  for (const r of rows) {
-    if (r.length <= iGroup || !RE_ID.test(r[iId])) continue;
-    if (/^\d+$/.test(rowIds.get(r) || '')) internos[r[iId]] = rowIds.get(r);
-    const grupo = r[iGroup];
-    if (grupo === '-') sinGrupo.push(r[iId]);
-    else if (grupo !== '') asignados.add(r[iId]);
+  const internos = {}; // ID visible -> ID interno, necesario para el pick up
+  for (const t of tickets) {
+    const id = String(t.display_id || '');
+    if (!RE_ID.test(id)) continue;
+    if (/^\d+$/.test(String(t.id || ''))) internos[id] = String(t.id);
+    if (t.group && (t.group.name || t.group.id)) asignados.add(id);
+    else sinGrupo.push(id);
   }
   return { sinGrupo, asignados, internos };
 }
@@ -323,12 +387,7 @@ async function main() {
     context = await abrirContexto({ headless: HEADLESS, fueraDePantalla: !HEADLESS });
     await cargarCookies(context);
     page = context.pages()[0] || await context.newPage();
-    page.on('request', r => {
-      if (r.url().startsWith(`${SDP_BASE_URL}/api/v3/`) && r.headers()['x-zcsrf-token']) {
-        cabecerasApi = r.headers();
-      }
-    });
-    contextoActual = context;
+    conectarSesion(context, page);
   };
 
   const cerrar = async () => {
@@ -376,8 +435,7 @@ async function main() {
 
       if (resultado === 'EXPIRADA') {
         console.error(`Sesión expirada (${page.url()})`);
-        contextoActual = null;
-        cabecerasApi = null;
+        desconectarSesion();
         await context.close().catch(() => {});
         context = null;
         page = null;
@@ -402,9 +460,9 @@ async function main() {
         } else if (!resultado.sinGrupo.includes(id)) {
           const p = state.pending[id];
           p.ausente = (p.ausente || 0) + 1;
-          console.log(`#${id} no aparece sin grupo en la bandeja (${p.ausente}/${AUSENCIAS_PARA_CERRAR})`);
+          console.log(`#${id} ya no aparece en la vista (${p.ausente}/${AUSENCIAS_PARA_CERRAR})`);
           if (p.ausente >= AUSENCIAS_PARA_CERRAR) {
-            await confirmar(state, id, `✅ Ticket #${id}: ya no aparece en la bandeja, dejo de recordarlo.`);
+            await confirmar(state, id, `✅ Ticket #${id}: ya no aparece en la vista (alguien lo tomó o se cerró), dejo de recordarlo.`);
           }
         } else {
           state.pending[id].ausente = 0;
@@ -435,4 +493,14 @@ async function main() {
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+// Exportado para las pruebas (test/); al ejecutar "npm start" no se usa
+module.exports = {
+  loadState, saveState, avisarTicket, confirmar, enviarRecordatorios,
+  apiSdp, tomarTicket, manejarTomar, procesarUpdate, revisar,
+  conectarSesion, desconectarSesion,
+  _setSesion(context, cabeceras) { contextoActual = context; cabecerasApi = cabeceras; vistaResuelta = null; },
+};

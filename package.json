@@ -7,6 +7,7 @@
     "setup": "playwright install chromium",
     "auth": "node src/auth.js",
     "start": "node src/monitor.js",
+    "test": "node --test test/monitor.test.js",
     "test:telegram": "node src/test-telegram.js"
   },
   "engines": {
