@@ -14,7 +14,10 @@ if (!/^https:\/\/.+/.test(SDP_BASE_URL)) {
 }
 
 // Todo lo que contiene sesión o estado vive en data/ (ignorado por Git)
-const DATA_DIR = path.join(ROOT, 'data');
+// AUTUM_DATA_DIR permite apuntar a otra carpeta (lo usan las pruebas para no tocar el estado real)
+const DATA_DIR = process.env.AUTUM_DATA_DIR
+  ? path.resolve(process.env.AUTUM_DATA_DIR)
+  : path.join(ROOT, 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const numero = (valor, porDefecto) => {
@@ -30,6 +33,10 @@ module.exports = {
   PERFIL_DIR: path.join(DATA_DIR, 'perfil'),
   AUTH_FILE: path.join(DATA_DIR, 'auth.json'),
   STATE_FILE: path.join(DATA_DIR, 'state.json'),
+
+  // Vista de la bandeja que se vigila. El ID (opcional) tiene prioridad sobre el nombre.
+  VISTA_NOMBRE: (process.env.SDP_VIEW_NAME || 'Unassigned Requests').trim(),
+  VISTA_ID: (process.env.SDP_VIEW_ID || '').trim(),
 
   INTERVALO_MS: numero(process.env.POLL_SECONDS, 60) * 1000,
   REMINDER_MIN: numero(process.env.REMINDER_MINUTES, 2),
