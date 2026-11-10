@@ -1,0 +1,12 @@
+node_modules/
+
+# Secretos y sesión: nunca se suben
+.env
+data/
+
+# Por si se ejecuta con la estructura antigua (archivos en la raíz)
+auth.json
+state.json
+perfil/
+
+*.log

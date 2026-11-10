@@ -1,11 +1,11 @@
 // src/monitor.js
 // Revisa la bandeja cada cierto tiempo, avisa de tickets nuevos sin grupo y
-// los recuerda por Telegram hasta que confirmes "Enterado".
+// los recuerda por Telegram hasta que los tomes ("Tomar") o confirmes "Enterado".
 const fs = require('fs');
 const { abrirContexto, cargarCookies, guardarSesion } = require('./browser');
 const { enviarTelegram, tg, chatId } = require('./notify');
 const {
-  APP_URL, BANDEJA_URL, AUTH_FILE, STATE_FILE,
+  SDP_BASE_URL, APP_URL, BANDEJA_URL, AUTH_FILE, STATE_FILE,
   INTERVALO_MS, REMINDER_MIN, ERROR_COOLDOWN_MS, SESION_COOLDOWN_MS,
   AUSENCIAS_PARA_CERRAR, HEADLESS,
 } = require('./config');
@@ -15,6 +15,13 @@ const RE_ID = /^\d{5,7}$/;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let columnasLogueadas = false;
+
+// Sesión viva del navegador, compartida con el pick up que se dispara desde Telegram
+let contextoActual = null;
+let cabecerasApi = null; // cabeceras (token CSRF incluido) que usa la propia página contra /api/v3
+const tomando = new Set(); // evita dobles pulsaciones del botón "Tomar"
+
+const hora = () => new Date().toLocaleTimeString();
 
 /* ---------- Estado (data/state.json) ---------- */
 
@@ -32,23 +39,29 @@ function saveState(state) {
 /* ---------- Telegram: avisos, recordatorios y confirmaciones ---------- */
 
 const teclado = id => ({
-  inline_keyboard: [[{ text: '✅ Enterado', callback_data: `ack:${id}` }]],
+  inline_keyboard: [[
+    { text: '🙋 Tomar', callback_data: `pick:${id}` },
+    { text: '✅ Enterado', callback_data: `ack:${id}` },
+  ]],
 });
+
+// Compatibilidad con state.json antiguo (msgRec único)
+const recordatoriosDe = p => [...(p.msgsRec || []), ...(p.msgRec ? [p.msgRec] : [])];
 
 async function borrarMensaje(messageId) {
   if (!messageId) return;
   await tg('deleteMessage', { chat_id: chatId(), message_id: messageId }).catch(() => {});
 }
 
-async function avisarTicket(state, id) {
+async function avisarTicket(state, id, rowId) {
   const msgId = await enviarTelegram(
-    `🎫 Ticket nuevo sin grupo: #${id}\n${BANDEJA_URL}\n\nTe lo recordaré cada ${REMINDER_MIN} min hasta que confirmes.`,
+    `🎫 Ticket nuevo sin grupo: #${id}\n${BANDEJA_URL}\n\nTe lo recordaré cada ${REMINDER_MIN} min hasta que lo tomes o confirmes.`,
     { reply_markup: teclado(id) }
   );
   // Solo si Telegram aceptó el mensaje lo damos por visto y pendiente
   state.seen.push(id);
   state.pending[id] = {
-    desde: Date.now(), ultimoAviso: Date.now(), avisos: 1, msgId, msgRec: null, ausente: 0,
+    desde: Date.now(), ultimoAviso: Date.now(), avisos: 1, msgId, msgsRec: [], ausente: 0, rowId,
   };
   saveState(state);
 }
@@ -58,7 +71,9 @@ async function confirmar(state, id, textoFinal) {
   if (!p) return false;
   delete state.pending[id];
   saveState(state);
-  await borrarMensaje(p.msgRec);
+  // Al confirmar se limpian todos los recordatorios acumulados
+  for (const m of recordatoriosDe(p)) await borrarMensaje(m);
+  console.log(`[${hora()}] cerrado #${id}: ${textoFinal}`);
   await tg('editMessageText', {
     chat_id: chatId(),
     message_id: p.msgId,
@@ -83,17 +98,84 @@ async function enviarRecordatorios(state) {
     // Si lo confirmaste mientras se enviaba, borramos el recordatorio recién mandado
     if (!state.pending[id]) { await borrarMensaje(nuevo); continue; }
 
-    await borrarMensaje(p.msgRec);
-    p.msgRec = nuevo;
+    // No borramos el recordatorio anterior: cada uno queda visible y notifica
+    p.msgsRec = [...recordatoriosDe(p), nuevo];
+    delete p.msgRec;
     p.ultimoAviso = ahora;
     p.avisos++;
     saveState(state);
+    console.log(`[${hora()}] recordatorio #${p.avisos - 1} de #${id}`);
+  }
+}
+
+/* ---------- Pick up vía la API interna de ServiceDesk ---------- */
+
+async function apiSdp(metodo, ruta) {
+  if (!contextoActual || !cabecerasApi) {
+    throw new Error('no hay sesión activa de ServiceDesk (¿expiró? ejecuta "npm run auth")');
+  }
+  const headers = {};
+  for (const k of ['accept', 'x-zcsrf-token', 'x-sdpod-appid', 'x-requested-with']) {
+    if (cabecerasApi[k]) headers[k] = cabecerasApi[k];
+  }
+  const res = await contextoActual.request.fetch(`${SDP_BASE_URL}/api/v3${ruta}`, {
+    method: metodo, headers, timeout: 20000,
+  });
+  const data = await res.json().catch(() => ({}));
+  const rs = [].concat(data.response_status || [])[0] || {};
+  if (!res.ok() || rs.status_code !== 2000) {
+    const detalle = (rs.messages || []).map(m => m.message).filter(Boolean).join('; ');
+    throw new Error(`ServiceDesk respondió ${res.status()} ${detalle || rs.status || ''}`.trim());
+  }
+  return data;
+}
+
+// Asigna el ticket al usuario de la sesión. Devuelve el texto final para Telegram; lanza Error si falla.
+async function tomarTicket(state, id) {
+  const p = state.pending[id];
+  if (!p) return null;
+  if (!p.rowId) throw new Error('aún no tengo el ID interno del ticket; vuelve a intentarlo en un minuto');
+
+  // No le quitamos el ticket a quien ya lo tenga
+  const antes = (await apiSdp('GET', `/requests/${p.rowId}`)).request || {};
+  if (String(antes.display_id) !== String(id)) throw new Error('el ID interno no corresponde a este ticket');
+  if (antes.technician && antes.technician.name) {
+    return `ℹ️ Ticket #${id}: ya estaba asignado a ${antes.technician.name}, no lo toqué.`;
+  }
+
+  await apiSdp('PUT', `/requests/${p.rowId}/_pickup`);
+
+  const despues = (await apiSdp('GET', `/requests/${p.rowId}`)).request || {};
+  const tecnico = despues.technician && despues.technician.name;
+  if (!tecnico) throw new Error('ServiceDesk aceptó el pick up pero el ticket sigue sin técnico; revísalo a mano');
+  return `🙋 Ticket #${id}: tomado, asignado a ${tecnico}.`;
+}
+
+async function manejarTomar(state, cb, id) {
+  if (!state.pending[id] || tomando.has(id)) {
+    await tg('answerCallbackQuery', {
+      callback_query_id: cb.id,
+      text: tomando.has(id) ? 'Ya lo estoy tomando…' : 'Ese ticket ya no está pendiente',
+    }).catch(() => {});
+    return;
+  }
+  tomando.add(id);
+  await tg('answerCallbackQuery', { callback_query_id: cb.id, text: `Tomando #${id}…` }).catch(() => {});
+  try {
+    const texto = await tomarTicket(state, id);
+    if (texto) await confirmar(state, id, texto);
+  } catch (e) {
+    console.error(`[${hora()}] pick up #${id} falló:`, e.message);
+    // El ticket sigue pendiente: los recordatorios continúan y el botón se puede volver a pulsar
+    await enviarTelegram(`❌ No pude tomar el ticket #${id}: ${e.message}\n${BANDEJA_URL}`).catch(() => {});
+  } finally {
+    tomando.delete(id);
   }
 }
 
 async function bucleRecordatorios(state) {
   while (true) {
-    await sleep(15000);
+    await sleep(5000);
     try { await enviarRecordatorios(state); }
     catch (e) { console.error('Recordatorios:', e.message); }
   }
@@ -104,7 +186,9 @@ async function procesarUpdate(state, u, permitido) {
   if (cb) {
     if (String(cb.message?.chat?.id) !== permitido) return; // ignorar chats ajenos
     const [accion, id] = (cb.data || '').split(':');
-    if (accion === 'ack') {
+    if (accion === 'pick' && RE_ID.test(id || '')) {
+      await manejarTomar(state, cb, id);
+    } else if (accion === 'ack') {
       const ok = await confirmar(state, id, `✅ Ticket #${id}: enterado.`);
       await tg('answerCallbackQuery', {
         callback_query_id: cb.id,
@@ -168,7 +252,7 @@ async function alertarFallo(state, motivo) {
 
 /* ---------- Lectura de la bandeja ---------- */
 
-// Devuelve 'EXPIRADA' o { sinGrupo: [ids], asignados: Set(ids) }
+// Devuelve 'EXPIRADA' o { sinGrupo: [ids], asignados: Set(ids), internos: { id: idInterno } }
 async function revisar(page) {
   await page.goto(BANDEJA_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
@@ -178,12 +262,17 @@ async function revisar(page) {
   await page.waitForTimeout(1500);
 
   // Solo filas que no contengan otras filas, con sus celdas directas
-  const rows = await page.$$eval('table tbody tr', trs =>
+  const filas = await page.$$eval('table tbody tr', trs =>
     trs
       .filter(tr => !tr.querySelector('tr'))
-      .map(tr => [...tr.children].map(td => td.innerText.trim()))
-      .filter(r => r.length > 0)
+      .map(tr => ({
+        rowId: tr.getAttribute('data-row-id'),
+        celdas: [...tr.children].map(td => td.innerText.trim()),
+      }))
+      .filter(f => f.celdas.length > 0)
   );
+  const rowIds = new Map(filas.map(f => [f.celdas, f.rowId]));
+  const rows = filas.map(f => f.celdas);
 
   // Columna ID = la que más filas con formato de ID tiene
   const maxCols = Math.max(0, ...rows.map(r => r.length));
@@ -209,13 +298,15 @@ async function revisar(page) {
 
   const sinGrupo = [];
   const asignados = new Set();
+  const internos = {}; // ID visible -> ID interno (data-row-id), necesario para la API
   for (const r of rows) {
     if (r.length <= iGroup || !RE_ID.test(r[iId])) continue;
+    if (/^\d+$/.test(rowIds.get(r) || '')) internos[r[iId]] = rowIds.get(r);
     const grupo = r[iGroup];
     if (grupo === '-') sinGrupo.push(r[iId]);
     else if (grupo !== '') asignados.add(r[iId]);
   }
-  return { sinGrupo, asignados };
+  return { sinGrupo, asignados, internos };
 }
 
 /* ---------- Programa principal ---------- */
@@ -232,6 +323,12 @@ async function main() {
     context = await abrirContexto({ headless: HEADLESS, fueraDePantalla: !HEADLESS });
     await cargarCookies(context);
     page = context.pages()[0] || await context.newPage();
+    page.on('request', r => {
+      if (r.url().startsWith(`${SDP_BASE_URL}/api/v3/`) && r.headers()['x-zcsrf-token']) {
+        cabecerasApi = r.headers();
+      }
+    });
+    contextoActual = context;
   };
 
   const cerrar = async () => {
@@ -279,6 +376,8 @@ async function main() {
 
       if (resultado === 'EXPIRADA') {
         console.error(`Sesión expirada (${page.url()})`);
+        contextoActual = null;
+        cabecerasApi = null;
         await context.close().catch(() => {});
         context = null;
         page = null;
@@ -296,11 +395,14 @@ async function main() {
 
       // Pendientes que ya no requieren recordatorio
       for (const id of Object.keys(state.pending)) {
+        // Pendientes de versiones anteriores no traen el ID interno: lo completamos aquí
+        if (!state.pending[id].rowId && resultado.internos[id]) state.pending[id].rowId = resultado.internos[id];
         if (resultado.asignados.has(id)) {
           await confirmar(state, id, `✅ Ticket #${id}: ya tiene grupo asignado, dejo de recordarlo.`);
         } else if (!resultado.sinGrupo.includes(id)) {
           const p = state.pending[id];
           p.ausente = (p.ausente || 0) + 1;
+          console.log(`#${id} no aparece sin grupo en la bandeja (${p.ausente}/${AUSENCIAS_PARA_CERRAR})`);
           if (p.ausente >= AUSENCIAS_PARA_CERRAR) {
             await confirmar(state, id, `✅ Ticket #${id}: ya no aparece en la bandeja, dejo de recordarlo.`);
           }
@@ -313,7 +415,7 @@ async function main() {
       // Tickets nuevos
       const nuevos = resultado.sinGrupo.filter(id => !state.seen.includes(id));
       for (const id of nuevos) {
-        await avisarTicket(state, id);
+        await avisarTicket(state, id, resultado.internos[id]);
         console.log(`[${new Date().toLocaleTimeString()}] AVISADO #${id}`);
       }
       if (!nuevos.length) {

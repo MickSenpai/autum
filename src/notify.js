@@ -20,6 +20,8 @@ async function tg(metodo, cuerpo = {}) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cuerpo),
+    // Sin esto una petición colgada bloquea el bucle de recordatorios hasta 5 min
+    signal: AbortSignal.timeout(((cuerpo.timeout || 0) + 15) * 1000),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok) {
